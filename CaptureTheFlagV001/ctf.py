@@ -396,7 +396,7 @@ class Viewer:
 
         for n, v in self.W.vehicles.items():
             g = self.glyphs[n]
-            g.set_center((v.pose.x, v.pose.y))
+            g.xy = (v.pose.x, v.pose.y)
             # triangles face heading; diamonds are +pi/4 offset
             if v.vtype == "heron":
                 g.orientation = self.W.heading[n]

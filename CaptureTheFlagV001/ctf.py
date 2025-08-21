@@ -108,18 +108,12 @@ class TagManager:
         return {"event": self._event_id, "result":"ok", "tagged":tgt.name, "expires_at":tgt.tagged_until}
 
     def clear_tag_if_home(self, v: Vehicle, home_center: Tuple[float,float], home_radius: float):
-        # If a tagged vehicle returns to home zone, clear immediately
         if now() < v.tagged_until:
             if dist(v.pose, Pose(*home_center)) <= home_radius:
                 v.tagged_until = 0.0
 
     def tick(self) -> None:
         """Optional housekeeping. Tags expire via timestamps, so this can be a no-op."""
-        # If you want to actively clean anything, do it here. For example:
-        # now_ts = now()
-        # for v in self.vehicles.values():
-        #     if v.tagged_until < now_ts:
-        #         v.tagged_until = 0.0
         pass
 
 @dataclass
@@ -344,7 +338,7 @@ class Viewer:
         self.W = world
         self.fig, self.ax = plt.subplots(figsize=(10,5))
         self.fig.subplots_adjust(top=0.9)
-        self.fig.suptitle("Aquaticus Capture‑the‑Flag (2 humans + 2 robots per team)", y=0.98)
+        self.fig.suptitle("Aquaticus Capture-the-Flag (2 humans + 2 robots per team)", y=0.98)
 
         self.ax.set_xlim(0, self.W.w); self.ax.set_ylim(0, self.W.h)
         self.ax.set_aspect("equal", "box")
@@ -357,9 +351,9 @@ class Viewer:
         self.ax.add_patch(Circle((self.W.blue_flag.x, self.W.blue_flag.y), self.W.home_radius, fill=False, ls="--"))
         self.ax.add_patch(Circle((self.W.red_flag.x,  self.W.red_flag.y),  self.W.home_radius, fill=False, ls="--"))
 
-        # flags
-        self.blue_flag_plot = self.ax.plot(self.W.blue_flag.x, self.W.blue_flag.y, marker="o", ms=8)[0]
-        self.red_flag_plot  = self.ax.plot(self.W.red_flag.x,  self.W.red_flag.y,  marker="o", ms=8)[0]
+        # flags as scatter points (clean updates via set_offsets)
+        self.blue_flag_scatter = self.ax.scatter([self.W.blue_flag.x], [self.W.blue_flag.y], s=40)
+        self.red_flag_scatter  = self.ax.scatter([self.W.red_flag.x],  [self.W.red_flag.y],  s=40)
 
         # vehicle glyphs: robots=triangles, humans=diamonds (square rotated)
         self.glyphs: Dict[str, RegularPolygon] = {}
@@ -374,7 +368,7 @@ class Viewer:
                                       edgecolor="k", lw=0.8)
             else:
                 poly = RegularPolygon((v.pose.x, v.pose.y), numVertices=4, radius=2.6,
-                                      orientation=self.W.heading[n] + math.pi/4.0,  # diamond shape
+                                      orientation=self.W.heading[n] + math.pi/4.0,  # diamond
                                       facecolor=("lightskyblue" if v.team=="blue" else "lightcoral"),
                                       edgecolor="k", lw=0.8)
             self.ax.add_patch(poly)
@@ -396,34 +390,40 @@ class Viewer:
 
         for n, v in self.W.vehicles.items():
             g = self.glyphs[n]
-            g.xy = (v.pose.x, v.pose.y)
-            # triangles face heading; diamonds are +pi/4 offset
+            g.xy = (v.pose.x, v.pose.y)  # move via center
             if v.vtype == "heron":
                 g.orientation = self.W.heading[n]
             else:
-                g.orientation = self.W.heading[n] + math.pi/4.0
+                g.orientation = self.W.heading[n] + math.pi / 4.0
 
             cr = self.carry_ring[n]; tr = self.tag_ring[n]
             cr.center = (v.pose.x, v.pose.y); tr.center = (v.pose.x, v.pose.y)
             cr.set_visible(len(v.carrying) > 0)
             tr.set_visible(now() < v.tagged_until)
 
-        # flags follow owner else stay home
-        for label, F in self.W.flag_mgr.flags.items():
-            if F.owner is None:
-                if label == "blue_flag":
-                    self.blue_flag_plot.set_data(self.W.blue_flag.x, self.W.blue_flag.y)
-                else:
-                    self.red_flag_plot.set_data(self.W.red_flag.x, self.W.red_flag.y)
-            else:
-                v = self.W.vehicles[F.owner]
-                (self.blue_flag_plot if label=="blue_flag" else self.red_flag_plot).set_data(v.pose.x, v.pose.y)
+        # flags follow owner else stay home (update scatter offsets)
+        # blue flag
+        bf = self.W.flag_mgr.flags["blue_flag"]
+        if bf.owner is None:
+            self.blue_flag_scatter.set_offsets([[self.W.blue_flag.x, self.W.blue_flag.y]])
+        else:
+            v = self.W.vehicles[bf.owner]
+            self.blue_flag_scatter.set_offsets([[v.pose.x, v.pose.y]])
+
+        # red flag
+        rf = self.W.flag_mgr.flags["red_flag"]
+        if rf.owner is None:
+            self.red_flag_scatter.set_offsets([[self.W.red_flag.x, self.W.red_flag.y]])
+        else:
+            v = self.W.vehicles[rf.owner]
+            self.red_flag_scatter.set_offsets([[v.pose.x, v.pose.y]])
 
         self.hud.set_text(
             f"timestep: {frame}\n"
             f"score  blue:{self.W.score['blue']}  red:{self.W.score['red']}\n"
             f"dashed = tagged, solid = carrying"
         )
+        # Return a list of artists to potentially blit; polygons + circles are fine
         return list(self.glyphs.values())
 
     def run(self, steps=600, interval_ms=60):

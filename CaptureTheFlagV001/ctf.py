@@ -1,272 +1,212 @@
-import pygame
-from queue import PriorityQueue
-from copy import deepcopy  # For temp grid copies
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple, Set
 import math
+import time
 
-# Constants
-ROWS = 20
-COLS = 20
-CELL_SIZE = 30
-WIDTH = COLS * CELL_SIZE
-HEIGHT = ROWS * CELL_SIZE
-WHITE = (255, 255, 255)
-BLACK = (0, 0, 0)
-GREY = (128, 128, 128)
-BLUE = (0, 0, 255)
-RED = (255, 0, 0)
+# -------------------------------
+# Utility geometry / data models
+# -------------------------------
+@dataclass
+class Pose:
+    x: float
+    y: float
 
-# Heuristic function (Manhattan distance)
-def h(p1, p2):
-    x1, y1 = p1
-    x2, y2 = p2
-    return abs(x1 - x2) + abs(y1 - y2)
+@dataclass
+class Vehicle:
+    name: str
+    team: str        # e.g., "blue" or "red"
+    vtype: str       # e.g., "mokai" or "heron"
+    pose: Pose
+    tagged_until: float = 0.0  # unix time when tag expires
+    last_tag_time: float = -1e9  # last time this vehicle successfully tagged someone
 
-# Get valid neighbors
-def get_neighbors(grid, row, col):
-    neighbors = []
-    directions = [(-1, 0), (1, 0), (0, -1), (0, 1)]
-    for dr, dc in directions:
-        nr, nc = row + dr, col + dc
-        if 0 <= nr < ROWS and 0 <= nc < COLS and grid[nr][nc] != 1:
-            neighbors.append((nr, nc))
-    return neighbors
+def now() -> float:
+    return time.time()
 
-# A* pathfinding
-def a_star(grid, start, goal):
-    if start == goal:
-        return []
-    open_set = PriorityQueue()
-    count = 0
-    open_set.put((h(start, goal), count, start))
-    came_from = {}
-    g_score = {start: 0}
-    closed = set()
-    while not open_set.empty():
-        f, _, current = open_set.get()
-        if current in closed:
-            continue
-        closed.add(current)
-        if current == goal:
-            # Reconstruct path
-            path = []
-            while current in came_from:
-                path.append(current)
-                current = came_from[current]
-            path.reverse()
-            return path
-        for neighbor in get_neighbors(grid, *current):
-            temp_g = g_score.get(current, float('inf')) + 1
-            if temp_g < g_score.get(neighbor, float('inf')):
-                came_from[neighbor] = current
-                g_score[neighbor] = temp_g
-                f = temp_g + h(neighbor, goal)
-                count += 1
-                open_set.put((f, count, neighbor))
-    return None
+def dist(a: Pose, b: Pose) -> float:
+    dx, dy = a.x - b.x, a.y - b.y
+    return math.hypot(dx, dy)
 
+def point_in_convex_polygon(p: Pose, poly: List[Tuple[float,float]]) -> bool:
+    # Standard winding / half-space test for convex polys
+    # Poly is list of (x,y) in CCW order.
+    n = len(poly)
+    if n < 3:
+        return False
+    prev = None
+    for i in range(n):
+        x1,y1 = poly[i]
+        x2,y2 = poly[(i+1)%n]
+        cross = (x2-x1)*(p.y-y1) - (y2-y1)*(p.x-x1)
+        if prev is None:
+            prev = cross
+        else:
+            if cross*prev < 0:
+                return False
+    return True
+
+# -------------------------------
+# Tag Manager (uFldTagManager)
+# -------------------------------
+@dataclass
+class TagManagerConfig:
+    tag_range: float = 25.0          # meters (default ~25 in docs)
+    tag_duration: float = 30.0       # seconds (default 30s)
+    tag_min_interval: float = 10.0   # seconds (default 10s)
+    zone_one: List[Tuple[float,float]] = field(default_factory=list) # blue zone polygon
+    zone_two: List[Tuple[float,float]] = field(default_factory=list) # red zone polygon
+    team_one: str = "blue"
+    team_two: str = "red"
+
+class TagManager:
+    def __init__(self, cfg: TagManagerConfig):
+        self.cfg = cfg
+        # vehicle_name -> Vehicle
+        self.vehicles: Dict[str, Vehicle] = {}
+
+    def update_node_report(self, name: str, team: str, vtype: str, pose: Pose):
+        self.vehicles[name] = Vehicle(name, team, vtype, pose, 
+                                      tagged_until=self.vehicles.get(name, Vehicle(name,team,vtype,pose)).tagged_until,
+                                      last_tag_time=self.vehicles.get(name, Vehicle(name,team,vtype,pose)).last_tag_time)
+
+    def _zone_for_team(self, team: str) -> List[Tuple[float,float]]:
+        return self.cfg.zone_one if team == self.cfg.team_one else self.cfg.zone_two
+
+    def is_tagged(self, v: Vehicle) -> bool:
+        return now() < v.tagged_until
+
+    def _in_own_zone(self, v: Vehicle) -> bool:
+        return point_in_convex_polygon(v.pose, self._zone_for_team(v.team))
+
+    def _cooldown_ready(self, v: Vehicle) -> bool:
+        return now() - v.last_tag_time >= self.cfg.tag_min_interval
+
+    def _eligible_targets(self, src: Vehicle) -> List[Vehicle]:
+        opp_team = self.cfg.team_two if src.team == self.cfg.team_one else self.cfg.team_one
+        candidates = []
+        for v in self.vehicles.values():
+            if v.team != opp_team: 
+                continue
+            if self.is_tagged(v): 
+                continue
+            # target must be outside its OWN zone
+            if point_in_convex_polygon(v.pose, self._zone_for_team(v.team)):
+                continue
+            # distance check
+            if dist(src.pose, v.pose) <= self.cfg.tag_range:
+                candidates.append(v)
+        return candidates
+
+    def request_tag(self, src_name: str) -> Dict:
+        # Return a result payload akin to TAG_RESULT_*
+        if src_name not in self.vehicles:
+            return {"event": "reject", "reason": "unknown_src"}
+
+        src = self.vehicles[src_name]
+
+        # 1) zone check for source
+        if not self._in_own_zone(src):
+            return {"event": "reject", "src": src.name, "team": src.team, "reason": "zone"}
+
+        # 2) cooldown check
+        if not self._cooldown_ready(src):
+            return {"event": "reject", "src": src.name, "team": src.team, "reason": "freq"}
+
+        # 3) candidate targets
+        targets = self._eligible_targets(src)
+        if not targets:
+            return {"event": "ok", "src": src.name, "team": src.team, "tagged": None}
+
+        # 4) nearest target
+        target = min(targets, key=lambda t: dist(src.pose, t.pose))
+
+        # 5) apply tag
+        target.tagged_until = now() + self.cfg.tag_duration
+        src.last_tag_time = now()
+        return {"event": "ok", "src": src.name, "team": src.team, "tagged": target.name, "expires_at": target.tagged_until}
+
+    def tick(self):
+        # expire tags is implicit via time checks; nothing to do but could emit events
+        pass
+
+# -------------------------------
+# Flag Manager (uFldFlagManager)
+# -------------------------------
+@dataclass
 class Flag:
-    def __init__(self, team, home_row, home_col):
-        self.team = team
-        self.home_pos = (home_row, home_col)
-        self.pos = self.home_pos
-        self.carried_by = None
+    label: str
+    pose: Pose
+    grab_range: float = 10.0
+    owner: Optional[str] = None  # vehicle name if grabbed
 
-    def get_pos(self):
-        if self.carried_by:
-            return self.carried_by.pos
-        return self.pos
+class FlagManager:
+    def __init__(self):
+        self.flags: Dict[str, Flag] = {}
+        self.vehicles: Dict[str, Vehicle] = {}
 
-class Agent:
-    def __init__(self, row, col, team):
-        self.pos = (row, col)
-        self.team = team
-        self.carrying_flag = False
-        self.path = []
-        self.current_target_pos = None
-        self.facing = 90 if team == 'blue' else 270  # degrees, 0: up, 90: right, 180: down, 270: left
+    def add_flag(self, label: str, x: float, y: float, grab_range: float = 10.0):
+        self.flags[label] = Flag(label, Pose(x, y), grab_range)
 
-    def update(self, grid, blue_flag, red_flag, all_agents):
-        enemy_flag = red_flag if self.team == 'blue' else blue_flag
-        home_pos = blue_flag.home_pos if self.team == 'blue' else red_flag.home_pos
-        target = enemy_flag.get_pos() if not self.carrying_flag else home_pos
+    def update_node_report(self, name: str, team: str, vtype: str, pose: Pose):
+        self.vehicles[name] = Vehicle(name, team, vtype, pose,
+                                      tagged_until=self.vehicles.get(name, Vehicle(name,team,vtype,pose)).tagged_until,
+                                      last_tag_time=self.vehicles.get(name, Vehicle(name,team,vtype,pose)).last_tag_time)
 
-        # Identify enemies
-        enemies = [a for a in all_agents if a.team != self.team]
+    def request_grab(self, vname: str) -> Dict:
+        # Vehicle asks to grab any flags within range.
+        if vname not in self.vehicles:
+            return {"result": "deny", "reason": "unknown_src"}
+        v = self.vehicles[vname]
 
-        # Create temp grid with enemies (and adjacent cells) as obstacles for evasion
-        temp_grid = deepcopy(grid)
-        for enemy in enemies:
-            er, ec = enemy.pos
-            # Mark enemy pos and adjacent (Manhattan <=1) as obstacle
-            for dr in [-1, 0, 1]:
-                for dc in [-1, 0, 1]:
-                    nr, nc = er + dr, ec + dc
-                    if 0 <= nr < ROWS and 0 <= nc < COLS:
-                        temp_grid[nr][nc] = 1
+        # In Aquaticus, a tagged vehicle cannot grab; this check is part of game mechanics.
+        if now() < v.tagged_until:
+            return {"result": "deny", "reason": "tagged"}
 
-        # Always replan for dynamic evasion
-        path = a_star(temp_grid, self.pos, target)
-        if path:
-            self.path = path
-            self.current_target_pos = target
-            # Move only one step per tick
-            if self.path:
-                next_pos = self.path[0]
-                dr = next_pos[0] - self.pos[0]
-                dc = next_pos[1] - self.pos[1]
-                if dr == -1:
-                    self.facing = 0
-                elif dr == 1:
-                    self.facing = 180
-                elif dc == 1:
-                    self.facing = 90
-                elif dc == -1:
-                    self.facing = 270
-                self.path.pop(0)
-                self.pos = next_pos
+        grabbed = []
+        for flag in self.flags.values():
+            if flag.owner is not None:
+                continue
+            if dist(v.pose, flag.pose) <= flag.grab_range:
+                flag.owner = vname
+                grabbed.append(flag.label)
 
-def draw(win, grid, blue_agents, red_agents, blue_flag, red_flag):
-    win.fill(WHITE)
-    for r in range(ROWS):
-        for c in range(COLS):
-            if grid[r][c] == 1:
-                pygame.draw.rect(win, BLACK, (c * CELL_SIZE, r * CELL_SIZE, CELL_SIZE, CELL_SIZE))
-    # Draw base circle outlines
-    blue_home_cx = blue_flag.home_pos[1] * CELL_SIZE + CELL_SIZE // 2
-    blue_home_cy = blue_flag.home_pos[0] * CELL_SIZE + CELL_SIZE // 2
-    pygame.draw.circle(win, BLUE, (blue_home_cx, blue_home_cy), CELL_SIZE // 2, width=2)
-    red_home_cx = red_flag.home_pos[1] * CELL_SIZE + CELL_SIZE // 2
-    red_home_cy = red_flag.home_pos[0] * CELL_SIZE + CELL_SIZE // 2
-    pygame.draw.circle(win, RED, (red_home_cx, red_home_cy), CELL_SIZE // 2, width=2)
-    # Draw flags if not carried
-    if not blue_flag.carried_by:
-        pygame.draw.rect(win, BLUE, (blue_flag.pos[1] * CELL_SIZE, blue_flag.pos[0] * CELL_SIZE, CELL_SIZE, CELL_SIZE))
-    if not red_flag.carried_by:
-        pygame.draw.rect(win, RED, (red_flag.pos[1] * CELL_SIZE, red_flag.pos[0] * CELL_SIZE, CELL_SIZE, CELL_SIZE))
-    # Draw agents as triangles
-    all_agents = blue_agents + red_agents
-    for agent in all_agents:
-        color = BLUE if agent.team == 'blue' else RED
-        cx = agent.pos[1] * CELL_SIZE + CELL_SIZE // 2
-        cy = agent.pos[0] * CELL_SIZE + CELL_SIZE // 2
-        r = CELL_SIZE // 3
-        sqrt3_half = math.sqrt(3) / 2
-        base_points = [
-            (cx, cy - r),
-            (cx - r * sqrt3_half, cy + r / 2),
-            (cx + r * sqrt3_half, cy + r / 2)
-        ]
-        angle_deg = agent.facing
-        angle_rad = math.radians(angle_deg)
-        cos_theta = math.cos(angle_rad)
-        sin_theta = math.sin(angle_rad)
-        points = []
-        for px, py in base_points:
-            dx = px - cx
-            dy = py - cy
-            new_dx = dx * cos_theta - dy * sin_theta
-            new_dy = dx * sin_theta + dy * cos_theta
-            points.append((cx + new_dx, cy + new_dy))
-        pygame.draw.polygon(win, color, points)
-        if agent.carrying_flag:
-            flag_color = RED if agent.team == 'blue' else BLUE
-            pygame.draw.rect(win, flag_color, (cx - CELL_SIZE // 4, cy - CELL_SIZE // 4, CELL_SIZE // 2, CELL_SIZE // 2))
-    # Draw grid lines
-    for i in range(ROWS + 1):
-        pygame.draw.line(win, GREY, (0, i * CELL_SIZE), (WIDTH, i * CELL_SIZE))
-    for j in range(COLS + 1):
-        pygame.draw.line(win, GREY, (j * CELL_SIZE, 0), (j * CELL_SIZE, HEIGHT))
-    pygame.display.update()
+        if not grabbed:
+            return {"result": "deny", "reason": "nothing_in_range"}
+        return {"result": "ok", "grabbed": grabbed}
 
-# Initialize Pygame
-pygame.init()
-win = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("AI Capture the Flag with Evasive A* Pathfinding")
+    def reset_flag_by_label(self, label: str):
+        if label in self.flags:
+            self.flags[label].owner = None
 
-# Grid (0: open, 1: wall)
-grid = [[0 for _ in range(COLS)] for _ in range(ROWS)]
+    def reset_flags_by_owner(self, vname: str):
+        for f in self.flags.values():
+            if f.owner == vname:
+                f.owner = None
 
-# Add some walls (middle barrier with gaps)
-for r in range(ROWS):
-    if r % 5 != 0:
-        grid[r][COLS // 2] = 1
+    def reset_all(self):
+        for f in self.flags.values():
+            f.owner = None
 
-# Flags
-blue_flag = Flag('blue', ROWS // 2, 2)
-red_flag = Flag('red', ROWS // 2, COLS - 3)
+    def scored_goal(self, vname: str, home_zone_poly: List[Tuple[float,float]]) -> Optional[List[str]]:
+        """
+        Call this when the vehicle enters its home zone.
+        If it carries flags and is untagged, it's a score: flags reset to 'ungrabbed'.
+        """
+        if vname not in self.vehicles:
+            return None
+        v = self.vehicles[vname]
+        if now() < v.tagged_until:
+            # Tagged before reaching home—lose flags
+            self.reset_flags_by_owner(vname)
+            return None
+        if not point_in_convex_polygon(v.pose, home_zone_poly):
+            return None
 
-# Agents (2 per team)
-blue_agents = [
-    Agent(ROWS // 2 - 2, 1, 'blue'),
-    Agent(ROWS // 2 + 2, 1, 'blue')
-]
-red_agents = [
-    Agent(ROWS // 2 - 2, COLS - 1, 'red'),
-    Agent(ROWS // 2 + 2, COLS - 1, 'red')
-]
+        delivered = []
+        for f in self.flags.values():
+            if f.owner == vname:
+                delivered.append(f.label)
+                f.owner = None
+        return delivered
 
-clock = pygame.time.Clock()
-run = True
-blue_score = 0
-red_score = 0
 
-while run:
-    clock.tick(5)  # Slow down to see moves
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            run = False
-
-    all_agents = blue_agents + red_agents
-
-    # Update agents (pass all_agents for enemy detection)
-    for agent in all_agents:
-        agent.update(grid, blue_flag, red_flag, all_agents)
-
-    # Check for flag pickups
-    for agent in all_agents:
-        enemy_flag = red_flag if agent.team == 'blue' else blue_flag
-        if enemy_flag.carried_by is None and agent.pos == enemy_flag.get_pos():
-            enemy_flag.carried_by = agent
-            enemy_flag.pos = agent.pos
-            agent.carrying_flag = True
-
-    # Check for scoring
-    for agent in all_agents:
-        if agent.carrying_flag:
-            home_pos = blue_flag.home_pos if agent.team == 'blue' else red_flag.home_pos
-            if agent.pos == home_pos:
-                if agent.team == 'blue':
-                    blue_score += 1
-                else:
-                    red_score += 1
-                print(f"Scores: Blue {blue_score}, Red {red_score}")
-                # Reset flag
-                enemy_flag = red_flag if agent.team == 'blue' else blue_flag
-                enemy_flag.carried_by = None
-                enemy_flag.pos = enemy_flag.home_pos
-                agent.carrying_flag = False
-
-    # Check for tags
-    for agent in all_agents:
-        col = agent.pos[1]
-        is_in_enemy_territory = (agent.team == 'blue' and col >= COLS // 2) or (agent.team == 'red' and col < COLS // 2)
-        if is_in_enemy_territory:
-            enemies = red_agents if agent.team == 'blue' else blue_agents
-            for enemy in enemies:
-                if abs(enemy.pos[0] - agent.pos[0]) + abs(enemy.pos[1] - agent.pos[1]) <= 1:
-                    if agent.carrying_flag:
-                        enemy_flag = red_flag if agent.team == 'blue' else blue_flag
-                        enemy_flag.carried_by = None
-                        enemy_flag.pos = agent.pos  # Drop at tag spot
-                        agent.carrying_flag = False
-                    # Respawn agent
-                    home_col = 1 if agent.team == 'blue' else COLS - 2
-                    agent.pos = (ROWS // 2, home_col)
-                    agent.facing = 90 if agent.team == 'blue' else 270
-                    agent.path = []
-                    agent.current_target_pos = None
-                    break
-
-    draw(win, grid, blue_agents, red_agents, blue_flag, red_flag)
-
-pygame.quit()
